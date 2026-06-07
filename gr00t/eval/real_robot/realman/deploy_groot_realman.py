@@ -26,8 +26,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
+import os
 import signal
 import time
+from datetime import datetime
 from typing import Any
 
 import cv2
@@ -110,6 +113,198 @@ def pin_left_arm_to_state(action_14d: np.ndarray, state_14d: np.ndarray) -> np.n
     return out
 
 
+def _debug_timestamp() -> str:
+    """Human-readable timestamp with millisecond precision."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _fmt_joints(arr: np.ndarray) -> str:
+    """Format 14D vector: L_arm(6), L_grip, R_arm(6), R_grip."""
+    a = np.asarray(arr, dtype=np.float32)
+    return (
+        f"L_arm=[{', '.join(f'{x:+.4f}' for x in a[0:6])}] "
+        f"L_grip={a[6]:+.4f} "
+        f"R_arm=[{', '.join(f'{x:+.4f}' for x in a[7:13])}] "
+        f"R_grip={a[13]:+.4f}"
+    )
+
+
+def _fmt_right_arm(arr: np.ndarray) -> str:
+    """Compact right-arm view (the only side we execute)."""
+    a = np.asarray(arr, dtype=np.float32)
+    return f"R_arm=[{', '.join(f'{x:+.4f}' for x in a[7:13])}] R_grip={a[13]:+.4f}"
+
+
+def _print_debug_inference(
+    *,
+    step: int,
+    chunk: list[np.ndarray],
+    open_loop_horizon: int,
+) -> None:
+    """Log raw model chunk right after policy inference."""
+    ts = _debug_timestamp()
+    print(f"\n[{ts}] INFER step={step} | model returned {len(chunk)} actions")
+    for idx, model_action in enumerate(chunk):
+        marker = ">" if idx < open_loop_horizon else " "
+        print(f"  {marker} chunk[{idx}]: {_fmt_joints(model_action)}")
+    print(f"  executing chunk[0:{open_loop_horizon}] before next inference")
+
+
+def _print_debug_step(
+    *,
+    step: int,
+    chunk_idx: int,
+    state_14d: np.ndarray,
+    model_action_14d: np.ndarray,
+    execute_action_14d: np.ndarray,
+) -> None:
+    """Log model output vs pinned command that will be sent to the robot."""
+    ts = _debug_timestamp()
+    delta_14d = execute_action_14d - state_14d
+    print(
+        f"\n[{ts}] STEP {step} chunk_idx={chunk_idx}\n"
+        f"  observed state : {_fmt_joints(state_14d)}\n"
+        f"  model output   : {_fmt_joints(model_action_14d)}\n"
+        f"  execute (sent) : {_fmt_joints(execute_action_14d)}\n"
+        f"  right delta    : {_fmt_right_arm(delta_14d)}"
+    )
+
+
+def _print_debug_execute_result(
+    *,
+    step: int,
+    execute_action_14d: np.ndarray,
+    dry_run: bool,
+    elapsed_ms: float,
+    robot_response: dict[str, Any] | None = None,
+) -> None:
+    """Log whether the command was posted to robot_api_server."""
+    ts = _debug_timestamp()
+    if dry_run:
+        print(
+            f"[{ts}] DRY-RUN step={step} | skipped POST "
+            f"(would send {_fmt_right_arm(execute_action_14d)})"
+        )
+        return
+
+    status = robot_response.get("status", "ok") if robot_response else "ok"
+    print(
+        f"[{ts}] EXECUTED step={step} | robot_api POST ok ({elapsed_ms:.1f} ms) "
+        f"| status={status} | sent {_fmt_right_arm(execute_action_14d)}"
+    )
+
+
+class RunLogger:
+    """Per-run structured logger: JSONL step log + per-camera MP4 videos.
+
+    Directory layout::
+
+        <log_dir>/run_YYYYMMDD_HHMMSS/
+            meta.json        — run config parameters
+            steps.jsonl      — one JSON line per control step
+            summary.json     — written on finalize (total steps, duration)
+            videos/
+                top_camera.mp4
+                left_wrist.mp4
+                right_wrist.mp4
+    """
+
+    def __init__(
+        self,
+        log_dir: str,
+        config: dict[str, Any],
+        camera_keys: list[str],
+        hz: float,
+        record_video: bool = True,
+    ):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_dir = os.path.join(log_dir, f"run_{ts}")
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        with open(os.path.join(self.run_dir, "meta.json"), "w") as f:
+            json.dump({"run_id": ts, **config}, f, indent=2)
+
+        self._steps_file = open(os.path.join(self.run_dir, "steps.jsonl"), "w")
+        self._camera_keys = camera_keys
+        self._hz = hz
+        self._record_video = record_video
+        self._start_time = time.time()
+
+        # Frame buffers: decoded RGB uint8 arrays, one list per camera.
+        self._video_frames: dict[str, list[np.ndarray]] = {k: [] for k in camera_keys}
+
+        print(f"Logging run to: {self.run_dir}")
+        if record_video:
+            print(f"  Video recording: ON  (cameras: {camera_keys})")
+
+    def log_step(
+        self,
+        *,
+        step: int,
+        chunk_idx: int,
+        is_infer_step: bool,
+        state_14d: np.ndarray,
+        model_action_14d: np.ndarray,
+        execute_action_14d: np.ndarray,
+        grip_locked: bool,
+        raw_obs: dict[str, Any],
+        inference_ms: float | None = None,
+        loop_ms: float | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "step": step,
+            "chunk_idx": chunk_idx,
+            "is_infer_step": is_infer_step,
+            "state": state_14d.tolist(),
+            "model_action": model_action_14d.tolist(),
+            "execute_action": execute_action_14d.tolist(),
+            "grip_locked": grip_locked,
+        }
+        if raw_obs.get("gripper_force") is not None:
+            record["gripper_force"] = raw_obs["gripper_force"]
+        if inference_ms is not None:
+            record["inference_ms"] = round(inference_ms, 1)
+        if loop_ms is not None:
+            record["loop_ms"] = round(loop_ms, 1)
+
+        self._steps_file.write(json.dumps(record) + "\n")
+        self._steps_file.flush()
+
+        if self._record_video:
+            for key in self._camera_keys:
+                if key in raw_obs.get("images", {}):
+                    self._video_frames[key].append(decode_image(raw_obs["images"][key]))
+
+    def finalize(self, total_steps: int) -> None:
+        elapsed = time.time() - self._start_time
+        self._steps_file.close()
+
+        with open(os.path.join(self.run_dir, "summary.json"), "w") as f:
+            json.dump({"total_steps": total_steps, "duration_s": round(elapsed, 2)}, f, indent=2)
+
+        if self._record_video:
+            video_dir = os.path.join(self.run_dir, "videos")
+            os.makedirs(video_dir, exist_ok=True)
+            for key, frames in self._video_frames.items():
+                if not frames:
+                    continue
+                h, w = frames[0].shape[:2]
+                out_path = os.path.join(video_dir, f"{key}.mp4")
+                writer = cv2.VideoWriter(
+                    out_path,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    self._hz,
+                    (w, h),
+                )
+                for frame in frames:
+                    writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                writer.release()
+                print(f"  Saved {key}: {out_path}  ({len(frames)} frames)")
+
+        print(f"Run log saved: {self.run_dir}  ({total_steps} steps, {elapsed:.1f}s)")
+
+
 class GR00TRealmanController:
     """Closed-loop client bridging robot_api_server and the GR00T ZMQ policy server."""
 
@@ -124,6 +319,11 @@ class GR00TRealmanController:
         timeout_ms: int = 15000,
         dry_run: bool = False,
         debug: bool = False,
+        auto_close_grip: bool = False,
+        grip_close_threshold: float = 0.80,
+        grip_lock_value: float = 0.35,
+        log_dir: str | None = None,
+        record_video: bool = True,
     ):
         from gr00t.policy.server_client import PolicyClient
 
@@ -132,6 +332,11 @@ class GR00TRealmanController:
         self.hz = hz
         self.dry_run = dry_run
         self.debug = debug
+        self.auto_close_grip = auto_close_grip
+        self.grip_close_threshold = grip_close_threshold
+        self.grip_lock_value = grip_lock_value
+        self._log_dir = log_dir
+        self._record_video = record_video
 
         print(f"Connecting to GR00T policy server at {policy_host}:{policy_port} ...")
         self.policy = PolicyClient(
@@ -154,8 +359,11 @@ class GR00TRealmanController:
         self.language_keys = self.modality_configs["language"].modality_keys
         self.action_horizon = len(self.modality_configs["action"].delta_indices)
 
+        # Default 1: re-infer every step so each command uses fresh obs/state.
+        # Longer horizons replay a fixed absolute trajectory and drift if the loop
+        # is slower than --hz or the arm does not track every setpoint in time.
         if open_loop_horizon is None:
-            open_loop_horizon = min(8, self.action_horizon)
+            open_loop_horizon = 1
         if open_loop_horizon <= 0 or open_loop_horizon > self.action_horizon:
             raise ValueError(
                 f"--open-loop-horizon must be in [1, {self.action_horizon}]; "
@@ -174,6 +382,28 @@ class GR00TRealmanController:
         if missing_cams:
             print(f"  WARNING: checkpoint expects cameras {missing_cams} not in CAMERA_KEYS")
 
+        self.logger: RunLogger | None = None
+        if self._log_dir is not None:
+            self.logger = RunLogger(
+                log_dir=self._log_dir,
+                config={
+                    "task": task,
+                    "robot_url": robot_url,
+                    "policy_host": policy_host,
+                    "policy_port": policy_port,
+                    "hz": hz,
+                    "open_loop_horizon": self.open_loop_horizon,
+                    "action_horizon": self.action_horizon,
+                    "dry_run": dry_run,
+                    "auto_close_grip": auto_close_grip,
+                    "grip_close_threshold": grip_close_threshold,
+                    "grip_lock_value": grip_lock_value,
+                },
+                camera_keys=self.video_keys,
+                hz=hz,
+                record_video=self._record_video,
+            )
+
     def _fetch_obs(self) -> dict[str, Any]:
         resp = requests.get(f"{self.robot_url}/observation", timeout=5.0)
         resp.raise_for_status()
@@ -182,15 +412,19 @@ class GR00TRealmanController:
     def _build_policy_obs(self, raw: dict[str, Any]) -> dict[str, Any]:
         return parse_observation_gr00t(raw, self.modality_configs, self.task)
 
-    def _execute_action(self, action_14d: np.ndarray):
+    def _execute_action(self, action_14d: np.ndarray) -> dict[str, Any] | None:
         if self.dry_run:
-            return
+            return None
         resp = requests.post(
             f"{self.robot_url}/action",
             json={"action": action_14d.tolist()},
             timeout=2.0,
         )
         resp.raise_for_status()
+        try:
+            return resp.json()
+        except ValueError:
+            return {"status": "ok", "body": resp.text}
 
     def _stop(self):
         if self.dry_run:
@@ -201,13 +435,11 @@ class GR00TRealmanController:
         except Exception as e:
             print(f"Warning: could not send stop: {e}")
 
-    def _infer_action_chunk(self, raw: dict[str, Any]) -> tuple[list[np.ndarray], np.ndarray]:
-        """Run one policy inference and return (chunk steps, reference state)."""
+    def _infer_action_chunk(self, raw: dict[str, Any]) -> list[np.ndarray]:
+        """Run one policy inference and return the absolute action chunk (length H)."""
         obs = self._build_policy_obs(raw)
         action_dict, _ = self.policy.get_action(obs)
-        chunk = parse_action_chunk(action_dict, self.action_keys)
-        state_14d = np.array(raw["state"], dtype=np.float32)
-        return chunk, state_14d
+        return parse_action_chunk(action_dict, self.action_keys)
 
     def run(self, max_steps: int = 500):
         dt = 1.0 / self.hz
@@ -222,51 +454,100 @@ class GR00TRealmanController:
         print(f"Max steps         : {max_steps}")
         print(f"Robot API         : {self.robot_url}")
         print(f"Dry run           : {self.dry_run}")
+        if self.auto_close_grip:
+            print(
+                f"Grip ratchet      : ON  "
+                f"(threshold={self.grip_close_threshold}, lock={self.grip_lock_value})"
+            )
         print(f"\nPress Ctrl+C to stop\n{'='*60}\n")
 
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
         step = 0
         pred_chunk: list[np.ndarray] | None = None
-        ref_state_14d: np.ndarray | None = None
         actions_from_chunk_completed = 0
+        grip_locked = False
 
         try:
             while step < max_steps:
                 loop_start = time.time()
 
-                # Re-infer when starting or after executing open_loop_horizon steps
-                # (same receding-horizon pattern as examples/DROID/main_gr00t.py)
-                if (
-                    pred_chunk is None
-                    or actions_from_chunk_completed >= self.open_loop_horizon
-                ):
-                    raw = self._fetch_obs()
-                    pred_chunk, ref_state_14d = self._infer_action_chunk(raw)
-                    actions_from_chunk_completed = 0
+                # Fresh observation every control step (matches pickup-objects DeployLoop).
+                raw = self._fetch_obs()
+                state_14d = np.array(raw["state"], dtype=np.float32)
 
+                # Re-infer when starting or after executing open_loop_horizon steps.
+                # Use open_loop_horizon=1 for true closed-loop on hardware.
+                is_infer_step = pred_chunk is None or actions_from_chunk_completed >= self.open_loop_horizon
+                inference_ms: float | None = None
+                if is_infer_step:
+                    infer_start = time.time()
+                    pred_chunk = self._infer_action_chunk(raw)
+                    inference_ms = (time.time() - infer_start) * 1000.0
+                    actions_from_chunk_completed = 0
                     if self.debug:
-                        s = np.array(raw["state"], dtype=np.float32)
-                        a0 = pin_left_arm_to_state(pred_chunk[0], s)
-                        print(
-                            f"[infer step {step}] state R={s[7:10].round(3)} "
-                            f"grip={s[13]:.3f} | action0 R={a0[7:10].round(3)} "
-                            f"grip={a0[13]:.3f}"
+                        _print_debug_inference(
+                            step=step,
+                            chunk=pred_chunk,
+                            open_loop_horizon=self.open_loop_horizon,
                         )
 
-                assert pred_chunk is not None and ref_state_14d is not None
-                action_14d = pin_left_arm_to_state(
-                    pred_chunk[actions_from_chunk_completed],
-                    ref_state_14d,
-                )
-                self._execute_action(action_14d)
+                assert pred_chunk is not None
+                model_action_14d = pred_chunk[actions_from_chunk_completed]
+                execute_action_14d = pin_left_arm_to_state(model_action_14d, state_14d)
+
+                if self.auto_close_grip:
+                    right_grip = execute_action_14d[13]
+                    if not grip_locked and right_grip < self.grip_close_threshold:
+                        grip_locked = True
+                        if self.debug:
+                            ts = _debug_timestamp()
+                            print(f"[{ts}] GRIP LOCK engaged at step={step} (grip={right_grip:.4f})")
+                    if grip_locked:
+                        execute_action_14d = execute_action_14d.copy()
+                        execute_action_14d[13] = min(right_grip, self.grip_lock_value)
+
+                if self.debug:
+                    _print_debug_step(
+                        step=step,
+                        chunk_idx=actions_from_chunk_completed,
+                        state_14d=state_14d,
+                        model_action_14d=model_action_14d,
+                        execute_action_14d=execute_action_14d,
+                    )
+
+                exec_start = time.time()
+                robot_response = self._execute_action(execute_action_14d)
+                if self.debug:
+                    _print_debug_execute_result(
+                        step=step,
+                        execute_action_14d=execute_action_14d,
+                        dry_run=self.dry_run,
+                        elapsed_ms=(time.time() - exec_start) * 1000.0,
+                        robot_response=robot_response,
+                    )
+
+                if self.logger is not None:
+                    self.logger.log_step(
+                        step=step,
+                        chunk_idx=actions_from_chunk_completed,
+                        is_infer_step=is_infer_step,
+                        state_14d=state_14d,
+                        model_action_14d=model_action_14d,
+                        execute_action_14d=execute_action_14d,
+                        grip_locked=grip_locked,
+                        raw_obs=raw,
+                        inference_ms=inference_ms,
+                        loop_ms=(time.time() - loop_start) * 1000.0,
+                    )
+
                 actions_from_chunk_completed += 1
                 step += 1
 
                 if step % 30 == 0 and not self.debug:
                     print(
                         f"Step {step:4d} | chunk_idx={actions_from_chunk_completed - 1} | "
-                        f"R_cmd={action_14d[7:10].round(3)} grip={action_14d[13]:.3f}"
+                        f"R_cmd={execute_action_14d[7:10].round(3)} grip={execute_action_14d[13]:.3f}"
                     )
 
                 elapsed = time.time() - loop_start
@@ -283,6 +564,8 @@ class GR00TRealmanController:
             print("\nStopping...")
         finally:
             self._stop()
+            if self.logger is not None:
+                self.logger.finalize(step)
             print(f"Completed {step} steps.")
 
 
@@ -322,8 +605,9 @@ def main():
         type=int,
         default=None,
         help=(
-            "Steps to execute from each action chunk before re-inferring "
-            f"(default: min(8, model horizon))"
+            "Steps to execute from each action chunk before re-inferring. "
+            "Use 1 on the real robot (default) so every command uses a fresh observation; "
+            "larger values (e.g. 8) only if the loop reliably meets --hz and the arm tracks."
         ),
     )
     parser.add_argument(
@@ -346,7 +630,50 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Print state vs predicted action on every inference call",
+        help=(
+            "Timestamped debug logs: model chunk on inference, model output vs "
+            "pinned execute command, and robot_api POST result each step"
+        ),
+    )
+    parser.add_argument(
+        "--auto-close-grip",
+        action="store_true",
+        help=(
+            "Gripper ratchet: once the commanded right-gripper value drops below "
+            "--grip-close-threshold, lock it to --grip-lock-value and never reopen. "
+            "Eliminates open/close jitter during bottle approach."
+        ),
+    )
+    parser.add_argument(
+        "--grip-close-threshold",
+        type=float,
+        default=0.80,
+        help="Right-gripper value below which the ratchet engages (default: 0.80)",
+    )
+    parser.add_argument(
+        "--grip-lock-value",
+        type=float,
+        default=0.35,
+        help="Right-gripper value to lock to once the ratchet engages (default: 0.35)",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="./runs",
+        help=(
+            "Directory for per-run logs (steps.jsonl, meta.json, videos/). "
+            "Each run gets its own timestamped subdirectory. Pass --no-log to disable."
+        ),
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable all logging (steps.jsonl, meta.json, video recording).",
+    )
+    parser.add_argument(
+        "--no-record-video",
+        action="store_true",
+        help="Log steps.jsonl/meta.json but skip per-camera video recording.",
     )
 
     args = parser.parse_args()
@@ -361,6 +688,11 @@ def main():
         timeout_ms=args.timeout_ms,
         dry_run=args.dry_run,
         debug=args.debug,
+        auto_close_grip=args.auto_close_grip,
+        grip_close_threshold=args.grip_close_threshold,
+        grip_lock_value=args.grip_lock_value,
+        log_dir=None if args.no_log else args.log_dir,
+        record_video=not args.no_record_video,
     )
     controller.run(max_steps=args.max_steps)
 
