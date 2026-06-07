@@ -90,19 +90,20 @@ Three-process architecture (see `commands.md` for local terminal commands):
 - `--open-loop-horizon 16` — use the full trained horizon for maximum arm reach. Produces a brief jerk every ~16 steps due to inference latency (~700 ms); acceptable in practice.
 - `--auto-close-grip` — gripper ratchet: once the right-gripper command drops below `--grip-close-threshold` (default 0.80), locks to `--grip-lock-value` (default 0.35) and never reopens. Eliminates open/close jitter during bottle approach. Tune threshold if the lock engages too early or late.
 - `--hz 15` — match training collection rate; use `--hz 10` if gripper state is only published at 10 Hz.
-- Omit `--debug` for production runs (adds verbose per-step logging; also prints `GRIP LOCK engaged` when the ratchet fires).
+- Omit `--debug` for production runs — debug messages are always written to `run.log` regardless of this flag.
 
 **Avoid on hardware:** `--open-loop-horizon 1` at current Orin inference speeds (~700 ms) — the arm will not move because `chunk[0]` is always a hold-position command at 1.5 Hz effective rate.
 
-**`--debug`** prints timestamped logs: model chunk on inference, model output vs pinned execute command, and `robot_api` POST result each step.
+**`--debug`** surfaces DEBUG-level messages on the terminal (model chunk on inference, model output vs pinned execute command, `robot_api` POST result, `GRIP LOCK engaged`). These are always written to `run.log` even without `--debug`.
 
 **Task string** must match training (e.g. `"pick up bottle"`).
 
 **Run logging** is on by default. Each run creates `./runs/run_YYYYMMDD_HHMMSS/` containing:
 - `meta.json` — run parameters
+- `run.log` — full timestamped log at DEBUG level (loguru); captures everything even without `--debug` on the terminal
 - `steps.jsonl` — per-step record: observed state (14D), model prediction (14D), executed action (14D), grip lock status, gripper force, inference latency, loop timing
 - `summary.json` — total steps and duration
-- `videos/` — one MP4 per camera at `--hz`
+- `videos/` — one smooth MP4 per camera at `--hz`, recorded by a background thread independent of inference timing
 
 Use `--log-dir <path>` to change the output root, `--no-record-video` to skip video (saves memory), or `--no-log` to disable entirely.
 

@@ -49,18 +49,19 @@ Logs are written automatically to `./runs/run_YYYYMMDD_HHMMSS/` (override with `
 - `--auto-close-grip` — gripper ratchet: once the right gripper command drops below 0.80, it locks to 0.35 and never reopens. Eliminates the open/close jitter during bottle approach. Safe to omit if you want the raw model output.
 - `--grip-close-threshold 0.80` — (default) tune higher (e.g. 0.90) to engage the ratchet earlier, lower (e.g. 0.70) to engage later.
 - `--grip-lock-value 0.35` — (default) how closed the gripper locks to once engaged.
-- `--debug` — timestamped per-step logs: model chunk on inference, model vs execute command, robot_api POST result, and a `GRIP LOCK engaged` line when the ratchet fires.
+- `--debug` — shows DEBUG-level logs on the terminal (model chunk on inference, model vs execute command, robot_api POST result). Always captured to `run.log` regardless.
 - `--hz 10` — use if gripper state is only published at 10 Hz.
 - `--dry-run` — runs inference loop without sending any commands to the robot.
 - `--log-dir ./runs` — (default) directory for per-run logs.
-- `--no-log` — disable all logging (steps.jsonl, meta.json, video).
-- `--no-record-video` — log steps.jsonl/meta.json but skip video recording.
+- `--no-log` — disable all logging (steps.jsonl, meta.json, run.log, video).
+- `--no-record-video` — log steps.jsonl/meta.json/run.log but skip video recording.
 
 **Run log layout** (`./runs/run_YYYYMMDD_HHMMSS/`):
 - `meta.json` — all run parameters (task, hz, horizon, grip settings)
+- `run.log` — timestamped log of everything printed during the run (always DEBUG level); useful for post-run debugging without re-running with `--debug`
 - `steps.jsonl` — one JSON line per step: `timestamp`, `step`, `chunk_idx`, `is_infer_step`, `state` (14D), `model_action` (14D), `execute_action` (14D), `grip_locked`, `gripper_force`, `inference_ms`, `loop_ms`
 - `summary.json` — total steps and wall-clock duration
-- `videos/top_camera.mp4`, `left_wrist.mp4`, `right_wrist.mp4` — full-run camera recordings at `--hz`
+- `videos/top_camera.mp4`, `left_wrist.mp4`, `right_wrist.mp4` — smooth camera recordings at `--hz` (captured by a background thread, independent of inference timing)
 
 **note**: put the head camera to at least 300 
 ```
