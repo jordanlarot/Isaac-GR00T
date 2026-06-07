@@ -29,6 +29,8 @@ import base64
 import json
 import os
 import signal
+import sys
+import threading
 import time
 from datetime import datetime
 from typing import Any
@@ -36,6 +38,7 @@ from typing import Any
 import cv2
 import numpy as np
 import requests
+from loguru import logger
 
 # Camera names must match robot_api_server / config_loader / dataset modality.json
 CAMERA_KEYS = ["top_camera", "left_wrist", "right_wrist"]
@@ -141,13 +144,12 @@ def _print_debug_inference(
     chunk: list[np.ndarray],
     open_loop_horizon: int,
 ) -> None:
-    """Log raw model chunk right after policy inference."""
-    ts = _debug_timestamp()
-    print(f"\n[{ts}] INFER step={step} | model returned {len(chunk)} actions")
+    lines = [f"INFER step={step} | model returned {len(chunk)} actions"]
     for idx, model_action in enumerate(chunk):
         marker = ">" if idx < open_loop_horizon else " "
-        print(f"  {marker} chunk[{idx}]: {_fmt_joints(model_action)}")
-    print(f"  executing chunk[0:{open_loop_horizon}] before next inference")
+        lines.append(f"  {marker} chunk[{idx}]: {_fmt_joints(model_action)}")
+    lines.append(f"  executing chunk[0:{open_loop_horizon}] before next inference")
+    logger.debug("\n" + "\n".join(lines))
 
 
 def _print_debug_step(
@@ -158,11 +160,9 @@ def _print_debug_step(
     model_action_14d: np.ndarray,
     execute_action_14d: np.ndarray,
 ) -> None:
-    """Log model output vs pinned command that will be sent to the robot."""
-    ts = _debug_timestamp()
     delta_14d = execute_action_14d - state_14d
-    print(
-        f"\n[{ts}] STEP {step} chunk_idx={chunk_idx}\n"
+    logger.debug(
+        f"STEP {step} chunk_idx={chunk_idx}\n"
         f"  observed state : {_fmt_joints(state_14d)}\n"
         f"  model output   : {_fmt_joints(model_action_14d)}\n"
         f"  execute (sent) : {_fmt_joints(execute_action_14d)}\n"
@@ -178,24 +178,25 @@ def _print_debug_execute_result(
     elapsed_ms: float,
     robot_response: dict[str, Any] | None = None,
 ) -> None:
-    """Log whether the command was posted to robot_api_server."""
-    ts = _debug_timestamp()
     if dry_run:
-        print(
-            f"[{ts}] DRY-RUN step={step} | skipped POST "
+        logger.debug(
+            f"DRY-RUN step={step} | skipped POST "
             f"(would send {_fmt_right_arm(execute_action_14d)})"
         )
         return
-
     status = robot_response.get("status", "ok") if robot_response else "ok"
-    print(
-        f"[{ts}] EXECUTED step={step} | robot_api POST ok ({elapsed_ms:.1f} ms) "
+    logger.debug(
+        f"EXECUTED step={step} | robot_api POST ok ({elapsed_ms:.1f} ms) "
         f"| status={status} | sent {_fmt_right_arm(execute_action_14d)}"
     )
 
 
 class RunLogger:
     """Per-run structured logger: JSONL step log + per-camera MP4 videos.
+
+    Video frames are captured by a background thread that polls the robot API
+    at a fixed rate, completely independent of the control loop. This ensures
+    smooth video even when inference steps stall the loop for ~700 ms.
 
     Directory layout::
 
@@ -216,6 +217,8 @@ class RunLogger:
         camera_keys: list[str],
         hz: float,
         record_video: bool = True,
+        robot_url: str | None = None,
+        debug: bool = False,
     ):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = os.path.join(log_dir, f"run_{ts}")
@@ -224,18 +227,67 @@ class RunLogger:
         with open(os.path.join(self.run_dir, "meta.json"), "w") as f:
             json.dump({"run_id": ts, **config}, f, indent=2)
 
+        # Configure loguru: plain stderr (same look as print) + timestamped file.
+        log_level = "DEBUG" if debug else "INFO"
+        logger.remove()
+        logger.add(sys.stderr, format="<level>{message}</level>", level=log_level, colorize=True)
+        log_path = os.path.join(self.run_dir, "run.log")
+        self._log_handler_id = logger.add(
+            log_path,
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
+            level="DEBUG",
+            encoding="utf-8",
+        )
+
         self._steps_file = open(os.path.join(self.run_dir, "steps.jsonl"), "w")
         self._camera_keys = camera_keys
         self._hz = hz
         self._record_video = record_video
         self._start_time = time.time()
 
-        # Frame buffers: decoded RGB uint8 arrays, one list per camera.
+        # Frames captured by background thread; lock guards concurrent appends.
         self._video_frames: dict[str, list[np.ndarray]] = {k: [] for k in camera_keys}
+        self._frame_lock = threading.Lock()
+        self._capture_thread: threading.Thread | None = None
+        self._capturing = False
 
-        print(f"Logging run to: {self.run_dir}")
-        if record_video:
-            print(f"  Video recording: ON  (cameras: {camera_keys})")
+        logger.info(f"Logging run to: {self.run_dir}")
+        if record_video and robot_url:
+            self._start_capture_thread(robot_url)
+        elif record_video:
+            logger.warning("record_video=True but no robot_url — video disabled")
+
+    def _start_capture_thread(self, robot_url: str) -> None:
+        """Poll robot API at self._hz in a daemon thread for continuous camera frames."""
+        robot_url = robot_url.rstrip("/")
+        dt = 1.0 / self._hz
+        logger.info(f"Video recording: ON  (cameras: {self._camera_keys}, {self._hz:.0f} Hz)")
+
+        def _capture() -> None:
+            while self._capturing:
+                t0 = time.time()
+                try:
+                    resp = requests.get(f"{robot_url}/observation", timeout=3.0)
+                    if resp.ok:
+                        raw = resp.json()
+                        frames = {}
+                        for key in self._camera_keys:
+                            if key in raw.get("images", {}):
+                                frames[key] = decode_image(raw["images"][key])
+                        if frames:
+                            with self._frame_lock:
+                                for key, frame in frames.items():
+                                    self._video_frames[key].append(frame)
+                except Exception:
+                    pass
+                elapsed = time.time() - t0
+                remaining = dt - elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
+
+        self._capturing = True
+        self._capture_thread = threading.Thread(target=_capture, daemon=True, name="video-capture")
+        self._capture_thread.start()
 
     def log_step(
         self,
@@ -271,12 +323,12 @@ class RunLogger:
         self._steps_file.write(json.dumps(record) + "\n")
         self._steps_file.flush()
 
-        if self._record_video:
-            for key in self._camera_keys:
-                if key in raw_obs.get("images", {}):
-                    self._video_frames[key].append(decode_image(raw_obs["images"][key]))
-
     def finalize(self, total_steps: int) -> None:
+        # Stop capture thread before touching frame buffers.
+        if self._capture_thread is not None:
+            self._capturing = False
+            self._capture_thread.join(timeout=5.0)
+
         elapsed = time.time() - self._start_time
         self._steps_file.close()
 
@@ -286,7 +338,9 @@ class RunLogger:
         if self._record_video:
             video_dir = os.path.join(self.run_dir, "videos")
             os.makedirs(video_dir, exist_ok=True)
-            for key, frames in self._video_frames.items():
+            with self._frame_lock:
+                frames_snapshot = {k: list(v) for k, v in self._video_frames.items()}
+            for key, frames in frames_snapshot.items():
                 if not frames:
                     continue
                 h, w = frames[0].shape[:2]
@@ -300,9 +354,10 @@ class RunLogger:
                 for frame in frames:
                     writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                 writer.release()
-                print(f"  Saved {key}: {out_path}  ({len(frames)} frames)")
+                logger.info(f"Saved {key}: {out_path}  ({len(frames)} frames)")
 
-        print(f"Run log saved: {self.run_dir}  ({total_steps} steps, {elapsed:.1f}s)")
+        logger.info(f"Run log saved: {self.run_dir}  ({total_steps} steps, {elapsed:.1f}s)")
+        logger.remove(self._log_handler_id)
 
 
 class GR00TRealmanController:
@@ -338,7 +393,7 @@ class GR00TRealmanController:
         self._log_dir = log_dir
         self._record_video = record_video
 
-        print(f"Connecting to GR00T policy server at {policy_host}:{policy_port} ...")
+        logger.info(f"Connecting to GR00T policy server at {policy_host}:{policy_port} ...")
         self.policy = PolicyClient(
             host=policy_host,
             port=policy_port,
@@ -350,7 +405,7 @@ class GR00TRealmanController:
                 f"Cannot reach GR00T server at {policy_host}:{policy_port}. "
                 "Make sure run_gr00t_server.py is running."
             )
-        print("GR00T policy server connected.")
+        logger.info("GR00T policy server connected.")
 
         self.modality_configs = self.policy.get_modality_config()
         self.video_keys = self.modality_configs["video"].modality_keys
@@ -371,16 +426,16 @@ class GR00TRealmanController:
             )
         self.open_loop_horizon = open_loop_horizon
 
-        print(f"  video keys      : {self.video_keys}")
-        print(f"  state keys      : {self.state_keys}")
-        print(f"  action keys     : {self.action_keys}")
-        print(f"  language keys   : {self.language_keys}")
-        print(f"  action horizon  : {self.action_horizon}")
-        print(f"  execute steps   : {self.open_loop_horizon} per inference call")
+        logger.info(f"  video keys      : {self.video_keys}")
+        logger.info(f"  state keys      : {self.state_keys}")
+        logger.info(f"  action keys     : {self.action_keys}")
+        logger.info(f"  language keys   : {self.language_keys}")
+        logger.info(f"  action horizon  : {self.action_horizon}")
+        logger.info(f"  execute steps   : {self.open_loop_horizon} per inference call")
 
         missing_cams = set(self.video_keys) - set(CAMERA_KEYS)
         if missing_cams:
-            print(f"  WARNING: checkpoint expects cameras {missing_cams} not in CAMERA_KEYS")
+            logger.warning(f"checkpoint expects cameras {missing_cams} not in CAMERA_KEYS")
 
         self.logger: RunLogger | None = None
         if self._log_dir is not None:
@@ -402,6 +457,8 @@ class GR00TRealmanController:
                 camera_keys=self.video_keys,
                 hz=hz,
                 record_video=self._record_video,
+                robot_url=robot_url,
+                debug=debug,
             )
 
     def _fetch_obs(self) -> dict[str, Any]:
@@ -431,9 +488,9 @@ class GR00TRealmanController:
             return
         try:
             requests.post(f"{self.robot_url}/stop", timeout=2.0)
-            print("Emergency stop sent.")
+            logger.info("Emergency stop sent.")
         except Exception as e:
-            print(f"Warning: could not send stop: {e}")
+            logger.warning(f"Could not send stop: {e}")
 
     def _infer_action_chunk(self, raw: dict[str, Any]) -> list[np.ndarray]:
         """Run one policy inference and return the absolute action chunk (length H)."""
@@ -444,22 +501,22 @@ class GR00TRealmanController:
     def run(self, max_steps: int = 500):
         dt = 1.0 / self.hz
 
-        print(f"\n{'='*60}")
-        print("GR00T CLOSED-LOOP DEPLOYMENT — RIGHT ARM ONLY")
-        print(f"{'='*60}")
-        print(f"Task              : {self.task}")
-        print(f"Rate              : {self.hz} Hz")
-        print(f"Model horizon     : {self.action_horizon}")
-        print(f"Execute per infer : {self.open_loop_horizon}")
-        print(f"Max steps         : {max_steps}")
-        print(f"Robot API         : {self.robot_url}")
-        print(f"Dry run           : {self.dry_run}")
+        logger.info("=" * 60)
+        logger.info("GR00T CLOSED-LOOP DEPLOYMENT — RIGHT ARM ONLY")
+        logger.info("=" * 60)
+        logger.info(f"Task              : {self.task}")
+        logger.info(f"Rate              : {self.hz} Hz")
+        logger.info(f"Model horizon     : {self.action_horizon}")
+        logger.info(f"Execute per infer : {self.open_loop_horizon}")
+        logger.info(f"Max steps         : {max_steps}")
+        logger.info(f"Robot API         : {self.robot_url}")
+        logger.info(f"Dry run           : {self.dry_run}")
         if self.auto_close_grip:
-            print(
+            logger.info(
                 f"Grip ratchet      : ON  "
                 f"(threshold={self.grip_close_threshold}, lock={self.grip_lock_value})"
             )
-        print(f"\nPress Ctrl+C to stop\n{'='*60}\n")
+        logger.info("Press Ctrl+C to stop")
 
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
@@ -500,9 +557,7 @@ class GR00TRealmanController:
                     right_grip = execute_action_14d[13]
                     if not grip_locked and right_grip < self.grip_close_threshold:
                         grip_locked = True
-                        if self.debug:
-                            ts = _debug_timestamp()
-                            print(f"[{ts}] GRIP LOCK engaged at step={step} (grip={right_grip:.4f})")
+                        logger.info(f"GRIP LOCK engaged at step={step} (grip={right_grip:.4f})")
                     if grip_locked:
                         execute_action_14d = execute_action_14d.copy()
                         execute_action_14d[13] = min(right_grip, self.grip_lock_value)
@@ -545,7 +600,7 @@ class GR00TRealmanController:
                 step += 1
 
                 if step % 30 == 0 and not self.debug:
-                    print(
+                    logger.info(
                         f"Step {step:4d} | chunk_idx={actions_from_chunk_completed - 1} | "
                         f"R_cmd={execute_action_14d[7:10].round(3)} grip={execute_action_14d[13]:.3f}"
                     )
@@ -555,18 +610,18 @@ class GR00TRealmanController:
                 if sleep > 0:
                     time.sleep(sleep)
                 elif elapsed > dt * 1.5:
-                    print(
-                        f"Warning: step {step} took {elapsed*1000:.0f}ms "
+                    logger.warning(
+                        f"Step {step} took {elapsed*1000:.0f}ms "
                         f"(target {dt*1000:.0f}ms)"
                     )
 
         except KeyboardInterrupt:
-            print("\nStopping...")
+            logger.info("Stopping...")
         finally:
             self._stop()
             if self.logger is not None:
                 self.logger.finalize(step)
-            print(f"Completed {step} steps.")
+            logger.info(f"Completed {step} steps.")
 
 
 def main():
