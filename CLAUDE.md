@@ -122,6 +122,6 @@ Use `--log-dir <path>` to change the output root, `--no-record-video` to skip vi
 
 Each Jetson/Spark platform ships an `activate_*.sh` helper (`scripts/activate_orin.sh`, `scripts/activate_spark.sh`, `scripts/activate_thor.sh`) that exports platform-specific library paths. For dGPU, `source .venv/bin/activate` is sufficient.
 
-**Orin inference notes:** PyTorch eager is ~2.9 Hz on Orin (see `scripts/deployment/README.md` benchmarks). TensorRT on Orin is **DiT-only** (`--export-mode dit_only`); full backbone TRT is not supported on TRT 10.3. `run_gr00t_server.py` uses PyTorch `Gr00tPolicy` today — wiring TRT into the ZMQ server requires extra integration.
+**Orin inference notes:** PyTorch eager is ~2.9 Hz on Orin; TRT DiT-only (~4.6 Hz) is the best achievable on Orin because TRT 10.3 cannot compile the LLM backbone. `run_gr00t_server.py` supports TRT via `--trt-engine-path <engines-dir> --trt-mode dit_only` — build engines once with `build_trt_pipeline.py --export-mode dit_only` (the `llm_bf16.engine` failure is expected and harmless). See `commands.md` for the full build + run sequence.
 
 For full TRT build/verify steps and per-platform benchmarks, see `scripts/deployment/README.md`.

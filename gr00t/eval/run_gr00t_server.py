@@ -27,6 +27,8 @@ from gr00t.policy.replay_policy import ReplayPolicy
 from gr00t.policy.server_client import PolicyServer
 import tyro
 
+_VALID_TRT_MODES = ("n17_full_pipeline", "vit_llm_only", "action_head", "dit_only")
+
 
 DEFAULT_MODEL_SERVER_PORT = 5555
 
@@ -68,15 +70,35 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    # TensorRT acceleration (Orin: dit_only; dGPU/Thor: n17_full_pipeline)
+    trt_engine_path: str = ""
+    """Path to directory containing TRT engine files. When set, TRT replaces PyTorch
+    for the selected components. Build engines first with build_trt_pipeline.py.
+    Orin AGX: use --export-mode dit_only when building (TRT 10.3 cannot compile the LLM)."""
+
+    trt_mode: str = "dit_only"
+    """TRT acceleration mode: 'dit_only' (Orin, DiT action head only),
+    'action_head' (all 4 action-head engines), 'vit_llm_only', or
+    'n17_full_pipeline' (all engines; dGPU/Thor only)."""
+
 
 def main(config: ServerConfig):
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
+
+    if config.trt_engine_path and config.trt_mode not in _VALID_TRT_MODES:
+        raise ValueError(
+            f"--trt-mode must be one of {_VALID_TRT_MODES}; got '{config.trt_mode}'"
+        )
+
     print("Starting GR00T inference server...")
     print(f"  Embodiment tag: {config.embodiment_tag}")
     print(f"  Model path: {config.model_path}")
     print(f"  Device: {config.device}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
+    if config.trt_engine_path:
+        print(f"  TRT engine path: {config.trt_engine_path}")
+        print(f"  TRT mode: {config.trt_mode}")
 
     # Create and start the server
     if config.model_path is not None:
@@ -89,6 +111,13 @@ def main(config: ServerConfig):
             device=config.device,
             strict=config.strict,
         )
+        if config.trt_engine_path:
+            deploy_dir = str(Path(__file__).resolve().parents[2] / "scripts" / "deployment")
+            if deploy_dir not in sys.path:
+                sys.path.insert(0, deploy_dir)
+            from trt_model_forward import setup_tensorrt_engines
+
+            setup_tensorrt_engines(policy, config.trt_engine_path, mode=config.trt_mode)
     elif config.dataset_path is not None:
         if config.execution_horizon is None:
             raise ValueError(
