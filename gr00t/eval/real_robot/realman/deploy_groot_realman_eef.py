@@ -51,6 +51,7 @@ Recommended first runs: --dry-run --debug, then --max-steps 30 --hz 10.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import signal
@@ -287,7 +288,24 @@ class GR00TRealmanEEFController(GR00TRealmanController):
         grip_locked = False
         ik_failures = 0
 
+        # Single-worker executor keeps all ZMQ calls on one dedicated thread.
+        # ZMQ sockets are not thread-safe, so the main loop never calls _infer_action_chunk
+        # directly — all inference goes through this executor. With max_workers=1 there is
+        # never more than one in-flight inference at a time.
+        #
+        # Prefetch pattern: as soon as we start executing chunk N we submit inference for
+        # chunk N+1.  By the time the open_loop_horizon steps finish (~1067ms at 15 Hz) the
+        # ~700ms inference is already done and .result() returns instantly — no stall.
+        infer_executor = ThreadPoolExecutor(max_workers=1)
+        next_chunk_future = None
+
         try:
+            # Submit the very first inference before the loop.  Step 0 will still block
+            # ~inference_latency on .result(), but every subsequent chunk transition is
+            # near-instant because the background thread runs ahead of the main loop.
+            raw_init = self._fetch_obs()
+            next_chunk_future = infer_executor.submit(self._infer_action_chunk, raw_init)
+
             while step < max_steps:
                 loop_start = time.time()
 
@@ -298,13 +316,32 @@ class GR00TRealmanEEFController(GR00TRealmanController):
                     pred_chunk is None or actions_from_chunk_completed >= self.open_loop_horizon
                 )
                 inference_ms: float | None = None
+
                 if is_infer_step:
-                    infer_start = time.time()
-                    pred_chunk = self._infer_action_chunk(raw)  # 20D steps
-                    inference_ms = (time.time() - infer_start) * 1000.0
+                    # Collect the prefetched chunk.  On step 0 this blocks for the full
+                    # inference latency; on all later transitions it should return instantly.
+                    wait_start = time.time()
+                    pred_chunk = next_chunk_future.result()
+                    inference_ms = (time.time() - wait_start) * 1000.0
                     actions_from_chunk_completed = 0
+
+                    # Immediately start prefetching chunk N+1 with the current obs.
+                    # _fetch_obs() always returns a fresh dict so the executor thread holds
+                    # its own reference; the main loop's next _fetch_obs() call is unrelated.
+                    next_chunk_future = infer_executor.submit(self._infer_action_chunk, raw)
+
+                    if step > 0 and inference_ms > (self.open_loop_horizon * dt * 1000):
+                        logger.warning(
+                            f"Prefetch wait {inference_ms:.0f}ms at step={step} exceeds "
+                            f"chunk window {self.open_loop_horizon * dt * 1000:.0f}ms — "
+                            "inference is slower than the execution horizon"
+                        )
+
                     if self.debug:
-                        lines = [f"INFER step={step} | model returned {len(pred_chunk)} actions"]
+                        lines = [
+                            f"INFER step={step} (prefetch_wait={inference_ms:.0f}ms) | "
+                            f"model returned {len(pred_chunk)} actions"
+                        ]
                         for idx, a in enumerate(pred_chunk):
                             marker = ">" if idx < self.open_loop_horizon else " "
                             lines.append(
@@ -386,6 +423,9 @@ class GR00TRealmanEEFController(GR00TRealmanController):
         except KeyboardInterrupt:
             logger.info("Stopping...")
         finally:
+            if next_chunk_future is not None:
+                next_chunk_future.cancel()
+            infer_executor.shutdown(wait=False, cancel_futures=True)
             self._stop()
             if self.logger is not None:
                 self.logger.finalize(step)
