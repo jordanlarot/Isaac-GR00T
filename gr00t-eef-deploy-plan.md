@@ -9,7 +9,9 @@ Related docs:
 
 - [gr00t-eef-conversion-results.md](gr00t-eef-conversion-results.md) — dataset conversion and training
 - [gr00t-eef-robot-deploy.md](gr00t-eef-robot-deploy.md) — post-download deploy guide
-- [commands.md](commands.md) — operator runbook (joint-space + TRT today)
+- [commands.md](commands.md) — operator runbook (EEF + joint)
+- [eef-deploy-jerk-report.md](eef-deploy-jerk-report.md) — hardware jerk/sway analysis
+- [eef-deploy-umi-takeaways.md](eef-deploy-umi-takeaways.md) — UMI tuning (`--open-loop-horizon`, latency)
 
 ---
 
@@ -44,18 +46,23 @@ The EEF model expects **9D end-effector pose + gripper** per arm (not 6D joint a
 | EE pose in ROS bridge | `pickup-objects/src/r2d3/hardware/ros2_bridge.py` | `get_ee_poses_at_time()` already exists; used by data collection |
 | EE pose in dataset | training parquets | `observation.ee_pose` 14D layout documented in pickup-objects |
 
-### Missing / Broken for EEF
+### Still open for EEF
 
-| Item | Gap | Impact |
-|------|-----|--------|
-| `/observation` EE fields | `robot_api_server.py` returns joints only | Deploy client cannot build EEF state |
-| Observation builder | `deploy_groot_realman.py` hardcodes `left_arm`/`right_arm` joint keys | Wrong obs format even if server is EEF |
-| Action executor | Client expects 14D joint chunk; EEF model returns 20D (9+1+9+1) | Cannot POST to robot |
-| IK / Cartesian executor | No EEF→joint conversion in deploy path | Blocking for hardware motion |
-| `examples/RealMan/realman_dual_arm_eef_config.py` | Referenced in docs but **not in this repo** | Not blocking — config is in checkpoint `processor_config.json` |
-| `scripts/convert_to_eef_gr00t.py` | Referenced in docs but **not in this repo** | Need to port quat↔rot6d helpers or reimplement |
-| TRT engines for EEF checkpoint | Not built yet | Optional speedup after PyTorch path works |
-| `commands.md` EEF section | Only documents joint checkpoint | Operator confusion |
+| Item | Status | Notes |
+|------|--------|-------|
+| TRT engines for EEF checkpoint | Optional | Build per `commands.md`; ~4–5 Hz on Orin |
+| Open-loop eval on EEF checkpoint | Not verified | Offline sanity check before hardware |
+| Stale-action skip (UMI PD1.2) | Not implemented | See `eef-deploy-umi-takeaways.md` Tier 2 |
+| `examples/RealMan/realman_dual_arm_eef_config.py` | Not in repo | Config is in checkpoint `processor_config.json` |
+
+### Done (2026-06-11)
+
+| Item | Location |
+|------|----------|
+| `/observation` `ee_pose` (14D) | `pickup-objects/scripts/robot_api_server.py` |
+| EEF deploy client + IK | `deploy_groot_realman_eef.py`, `eef_utils.py`, `realman_ik.py` |
+| Operator runbook | `commands.md` (EEF section first) |
+| Jerk / UMI tuning docs | `eef-deploy-jerk-report.md`, `eef-deploy-umi-takeaways.md` |
 
 ### Important repo-specific corrections
 
@@ -352,7 +359,7 @@ python scripts/deployment/build_trt_pipeline.py \
 | Step | Command | Pass criteria |
 |------|---------|---------------|
 | 6a Dry run | `--dry-run --debug` | EEF obs/action shapes OK; IK residuals logged |
-| 6b Short live | `--max-steps 30 --open-loop-horizon 16 --hz 10` | Arm moves smoothly toward bottle; no safety stops |
+| 6b Short live | `--max-steps 30 --open-loop-horizon 6 --hz 8` | Arm moves toward bottle; no safety stops |
 | 6c Full run | `--max-steps 500 --auto-close-grip` | Task attempt; review `runs/` logs + video |
 
 **Recommended first settings:**
@@ -362,34 +369,22 @@ python gr00t/eval/real_robot/realman/deploy_groot_realman_eef.py \
   --task "pick up bottle" \
   --policy-host localhost --policy-port 5555 \
   --robot-url http://localhost:5000 \
-  --open-loop-horizon 16 --hz 10 \
+  --open-loop-horizon 6 --hz 8 \
   --auto-close-grip --grip-close-threshold 0.95
 ```
 
-After TRT + lower infer latency, try `--open-loop-horizon 4` or `1` for smoother motion.
+If still jerky: try `--open-loop-horizon 4`. After TRT, try `--open-loop-horizon 1` for true closed-loop. See [eef-deploy-jerk-report.md](eef-deploy-jerk-report.md).
 
 **Effort:** ~2–4 hours on hardware (iterative tuning).
 
 ---
 
-### Phase 7 — Documentation & operator runbook
+### Phase 7 — Documentation & operator runbook — **Done**
 
-**Goal:** Update operator docs once EEF path is validated.
-
-**Tasks:**
-
-1. Add EEF section to `commands.md`:
-   - Checkpoint path
-   - Server command (PyTorch + TRT)
-   - TRT build for EEF checkpoint
-   - EEF deploy client command
-   - Note: joint checkpoint section remains for fallback
-
-2. Update `CLAUDE.md` RealMan deploy section with EEF vs joint distinction.
-
-3. Mark checklist items complete in [gr00t-eef-robot-deploy.md](gr00t-eef-robot-deploy.md).
-
-**Effort:** ~1 hour.
+- [x] `commands.md` — EEF section (checkpoint, TRT, deploy client, tuning flags)
+- [x] `CLAUDE.md` / `AGENTS.md` — EEF vs joint deploy, recommended `--open-loop-horizon 6 --hz 8`
+- [x] [gr00t-eef-robot-deploy.md](gr00t-eef-robot-deploy.md) — status table + deploy commands
+- [x] [eef-deploy-jerk-report.md](eef-deploy-jerk-report.md), [eef-deploy-umi-takeaways.md](eef-deploy-umi-takeaways.md)
 
 ---
 
@@ -397,18 +392,20 @@ After TRT + lower infer latency, try `--open-loop-horizon 4` or `1` for smoother
 
 ### pickup-objects
 
-- [ ] `/observation` returns `ee_pose` (14D)
-- [ ] (Optional) `/observation` returns `left_eef_9d` / `right_eef_9d`
-- [ ] Document EE field in robot API docstring
+- [x] `/observation` returns `ee_pose` (14D)
+- [ ] (Optional) `/observation` returns precomputed `left_eef_9d` / `right_eef_9d`
+- [x] Document EE field in robot API docstring
 
 ### Isaac-GR00T
 
-- [ ] `eef_utils.py` — quat ↔ rot6d conversion + tests
-- [ ] `realman_ik.py` — EEF → joint IK with seed joints
-- [ ] `deploy_groot_realman_eef.py` — EEF obs builder + IK execute path
+- [x] `eef_utils.py` — quat ↔ rot6d conversion + tests
+- [x] `realman_ik.py` — EEF → joint IK with seed joints
+- [x] `deploy_groot_realman_eef.py` — EEF obs builder + IK execute path
+- [x] `commands.md` EEF operator section
+- [x] `eef-deploy-jerk-report.md`, `eef-deploy-umi-takeaways.md` — hardware tuning docs
 - [ ] Open-loop eval passes on EEF checkpoint
 - [ ] TRT engines built for EEF checkpoint
-- [ ] `commands.md` EEF operator section
+- [ ] UMI stale-action skip in deploy client
 - [ ] (Optional) Port `examples/RealMan/realman_dual_arm_eef_config.py` for reproducibility
 
 ---

@@ -164,7 +164,7 @@ uv run python scripts/upload_gr00t_checkpoint.py \
 
 ### Step 7 — Robot deploy (requires IK, tackle after open-loop eval)
 
-See **[gr00t-eef-robot-deploy.md](gr00t-eef-robot-deploy.md)** for the full post-download checklist: expose EE pose in `robot_api_server`, start `run_gr00t_server.py`, IK/Cartesian execution, and updates to `deploy_groot_realman.py`.
+See **[gr00t-eef-robot-deploy.md](gr00t-eef-robot-deploy.md)** for the full post-download checklist and **[commands.md](commands.md)** for live operator commands (`deploy_groot_realman_eef.py`). Hardware tuning: [eef-deploy-jerk-report.md](eef-deploy-jerk-report.md), [eef-deploy-umi-takeaways.md](eef-deploy-umi-takeaways.md).
 
 The joint-space checkpoint and its deploy path remain valid for hardware tests
 that don't need EEF.

@@ -2,12 +2,16 @@
 
 What to do after downloading the finetuned **end-effector (EEF)** checkpoint to the robot.
 
-**Model:** `jordanlarot/gr00t-pick-place-bottle-eef-10k`  
-**Task:** pick-place bottle (bimanual demos; first deploy can be right-arm only)  
-**Training config:** `Isaac-GR00T/examples/RealMan/realman_dual_arm_eef_config.py`
+**Model:** `jordanlarot/gr00t-pick-place-bottle-eef-10k` (local: `/home/r2d3/checkpoints/gr00t-pick-place-bottle-eef-10k`)  
+**Task:** pick-place bottle (bimanual demos; deploy is right-arm only)  
+**Deploy client:** `gr00t/eval/real_robot/realman/deploy_groot_realman_eef.py`  
+**Modality config:** baked into checkpoint `processor_config.json` (`new_embodiment`)
 
 Related docs:
 
+- [commands.md](commands.md) — operator runbook (EEF + joint terminal commands)
+- [eef-deploy-jerk-report.md](eef-deploy-jerk-report.md) — hardware jerk/sway analysis from `runs/`
+- [eef-deploy-umi-takeaways.md](eef-deploy-umi-takeaways.md) — UMI paper applied: horizon, latency, relative vs absolute
 - [gr00t-eef-conversion-results.md](gr00t-eef-conversion-results.md) — dataset conversion and training results
 - [gr00t-eef-training-plan.md](gr00t-eef-training-plan.md) — full EE training plan
 - [environments.md](environments.md) — Python 3.12 (repo root) vs Python 3.10 (`Isaac-GR00T/.venv`)
@@ -35,21 +39,20 @@ GR00T handles **relative → absolute** EEF conversion internally during inferen
 Three processes, same pattern as the joint-space GR00T deploy:
 
 ```
-┌─────────────────────────┐     HTTP :5000      ┌──────────────────────────┐
-│  robot_api_server.py    │ ◄────────────────── │  deploy_groot_realman.py │
-│  (on robot)             │                     │  (robot or GPU machine)  │
-│  cameras, state, action │                     │  closed-loop client      │
-└─────────────────────────┘                     └────────────┬─────────────┘
+┌─────────────────────────┐     HTTP :5000      ┌──────────────────────────────┐
+│  robot_api_server.py    │ ◄────────────────── │  deploy_groot_realman_eef.py │
+│  (on robot)             │                     │  ee_pose → EEF obs → IK      │
+│  state, ee_pose, images │                     │  → 14D joint /action         │
+└─────────────────────────┘                     └────────────┬─────────────────┘
                                                              │ ZMQ :5555
                                                              ▼
                                                 ┌──────────────────────────┐
                                                 │  run_gr00t_server.py     │
-                                                │  (GPU machine)           │
-                                                │  GR00T inference         │
+                                                │  relative EEF → absolute │
                                                 └──────────────────────────┘
 ```
 
-**What changes for EEF:** the observation builder and action executor in the deploy client, plus `robot_api_server` must expose EE pose. The GR00T server stays the same idea — load the EEF checkpoint and serve over ZMQ.
+**What changes for EEF:** observation builder (`ee_pose` → `left/right_eef_9d`), IK executor, and 20D action chunk. Server decodes **relative trajectory** (UMI-style) to absolute EEF; robot receives **absolute** joint commands.
 
 ---
 
@@ -57,15 +60,16 @@ Three processes, same pattern as the joint-space GR00T deploy:
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| EEF checkpoint on HF | Done | `jordanlarot/gr00t-pick-place-bottle-eef-10k` |
-| `realman_dual_arm_eef_config.py` | Done | Defines EEF modality keys and `RELATIVE` action rep |
-| `run_gr00t_server.py` | Done | Loads checkpoint, serves policy over ZMQ |
-| `deploy_groot_realman.py` | **Joint only** | Expects `left_arm` / `right_arm` joint keys; sends 14D joints |
-| `robot_api_server.py` | **Joint only** | `/observation` returns 14D `state`; `/action` expects 14D joints |
-| `Hardware_Bridge_ROS2.py` | **Partial** | Subscribes to `udp_arm_position` but does not expose EE in API |
-| IK / Cartesian executor | **Missing** | No EEF → joint conversion in deploy path yet |
+| EEF checkpoint | Done | `/home/r2d3/checkpoints/gr00t-pick-place-bottle-eef-10k` |
+| `run_gr00t_server.py` | Done | Relative EEF → absolute in `decode_action` |
+| `deploy_groot_realman_eef.py` | Done | EEF obs, IK, prefetch, run logging |
+| `eef_utils.py`, `realman_ik.py` | Done | quat/rot6d + QPIK IK (calibrated to dataset frame) |
+| `robot_api_server.py` | Done | `/observation` returns `state`, `ee_pose` (14D), images |
+| TRT engines for EEF | Optional | Build per `commands.md`; ~4–5 Hz on Orin |
+| Stale-action skip (UMI PD1.2) | **Not yet** | See `eef-deploy-umi-takeaways.md` Tier 2 |
+| `deploy_groot_realman.py` | Joint only | Wrong client for EEF checkpoint |
 
-The **joint-space** checkpoint and its deploy path remain valid if you want a quicker first hardware test without IK. This doc is specifically for the **EEF** checkpoint.
+The **joint-space** checkpoint (`gr00t-pick-bottle-realman`) + `deploy_groot_realman.py` remain valid as a fallback without IK.
 
 ---
 
@@ -120,168 +124,78 @@ EEF error metrics are in metres / rotation units — not directly comparable to 
 ### Step 2 — Start the robot API server
 
 ```bash
-# On robot, from r2d3-training root
+cd /home/r2d3/pickup-objects
+export PYTHONPATH=~/pickup-objects/src:$PYTHONPATH
 python scripts/robot_api_server.py
 ```
 
-Today this only returns joint state. Steps 3–5 extend it for EEF deploy.
-
-Smoke-test the current API:
+Smoke-test (must include `ee_pose` with 14 floats for EEF deploy):
 
 ```bash
-curl http://localhost:5000/observation | python3 -m json.tool | head
+curl -s http://localhost:5000/observation | python3 -c "import sys,json; d=json.load(sys.stdin); print('ee_pose' in d, len(d.get('ee_pose',[])))"
 ```
+
+**14D `ee_pose` layout:** `[l_xyz(3), l_quat_xyzw(4), r_xyz(3), r_quat_xyzw(4)]` metres + quaternion per arm (each arm in its own Realman base frame). Conversion to `left/right_eef_9d` is in `gr00t/eval/real_robot/realman/eef_utils.py`.
 
 ---
 
-### Step 3 — Expose EE pose in observations
-
-The policy needs live EEF state in the same format as training.
-
-**Source (already subscribed in bridge):**
-
-- `/left_arm_controller/rm_driver/udp_arm_position`
-- `/right_arm_controller/rm_driver/udp_arm_position`
-
-**Layout (14D `ee_pose`, same as dataset):**
-
-| Index | Meaning |
-|-------|---------|
-| 0–2 | Left TCP position (x, y, z) in **metres** |
-| 3–6 | Left quaternion **(x, y, z, w)** |
-| 7–9 | Right TCP position (x, y, z) in **metres** |
-| 10–13 | Right quaternion **(x, y, z, w)** |
-
-**Coordinate frame:** each arm is in **its own Realman base frame**. Left and right are not in a shared world frame — treat them as independent modality keys (same as training).
-
-**Convert to GR00T `left_eef_9d` / `right_eef_9d` (9D each):**
-
-```
-[x, y, z, R[0,0], R[0,1], R[0,2], R[1,0], R[1,1], R[1,2]]
-```
-
-where the 6D rotation is the **first two rows** of the rotation matrix from the quaternion. Reuse the logic in `scripts/convert_to_eef_gr00t.py` (`_quat_xyzw_to_rot6d`).
-
-**Grippers:** slice from joint state — left index 6, right index 13 (same as dataset).
-
-**Work items:**
-
-1. Add `get_ee_pose()` (or similar) to `Hardware_Bridge_ROS2.py` — pack `l_ee_pose` / `r_ee_pose` into the 14D layout above.
-2. Extend `robot_api_server.py` `/observation` to return `ee_pose` (and optionally precomputed `left_eef_9d` / `right_eef_9d`).
-
----
-
-### Step 4 — Start the GR00T policy server
+### Step 3 — Start the GR00T policy server
 
 On the GPU machine:
 
 ```bash
 cd Isaac-GR00T
+source .venv/bin/activate
+source scripts/activate_orin.sh
 
-uv run python gr00t/eval/run_gr00t_server.py \
-  --model-path jordanlarot/gr00t-pick-place-bottle-eef-10k \
+python gr00t/eval/run_gr00t_server.py \
+  --model-path /home/r2d3/checkpoints/gr00t-pick-place-bottle-eef-10k \
   --embodiment-tag NEW_EMBODIMENT \
-  --modality-config-path examples/RealMan/realman_dual_arm_eef_config.py \
-  --device cuda \
+  --device cuda:0 \
   --host 0.0.0.0 \
   --port 5555
 ```
 
-Use the local checkpoint path if you downloaded to the robot or a specific directory.
+Optional TRT: add `--trt-engine-path .../gr00t-pick-place-bottle-eef-10k-trt/engines --trt-mode dit_only` (see `commands.md`).
 
-The server:
-
-- Normalizes / denormalizes actions
-- Converts **relative EEF deltas → absolute EEF targets** using the current `left_eef_9d` / `right_eef_9d` in the observation
+The server normalizes actions and converts **relative EEF trajectory → absolute EEF targets** (UMI PD2.1; not step-to-step deltas).
 
 ---
 
-### Step 5 — Convert EEF actions to robot commands (IK or Cartesian)
+### Step 4 — EEF deploy client (IK path implemented)
 
-After inference, the policy returns **absolute EEF targets** per arm plus gripper scalars. The robot stack today only accepts **joint** commands via `movej_cmd`.
+`deploy_groot_realman_eef.py` handles observation building, IK (`realman_ik.py`), prefetch inference, and run logging. Right arm only; left pinned to observed state.
 
-Pick one execution path:
-
-**Option A — IK → joint commands (fits current `robot_api_server`)**
-
-1. Take absolute EEF target (9D xyz+rot6d) for the arm being controlled.
-2. Convert rot6d back to a rotation matrix / quaternion.
-3. Run inverse kinematics for the RM65 → 6 joint angles.
-4. Pack into 14D: `[l_arm(6), l_gripper(1), r_arm(6), r_gripper(1)]`.
-5. POST to `http://<ROBOT_IP>:5000/action`.
-
-**Option B — Realman Cartesian motion API**
-
-Send the absolute EEF target directly to the Realman driver's Cartesian motion interface (if available in your ROS2 stack). This bypasses explicit IK in your deploy client but still requires correct frame and safety limits.
-
-**Grippers:** absolute scalars — pass through directly (not relative).
-
-**Scope for first test (recommended):** right arm only. Pin left arm EEF/joints to the current observed state (same pattern as `pin_left_arm_to_state` in `deploy_groot_realman.py`).
-
----
-
-### Step 6 — Update the deploy client
-
-`Isaac-GR00T/gr00t/eval/real_robot/realman/deploy_groot_realman.py` must be extended (or a new `deploy_groot_realman_eef.py` added).
-
-**Observation builder** — replace joint key mapping:
-
-```python
-# Today (joint checkpoint):
-state_by_key = {
-    "left_arm": state[0:6],
-    "left_gripper": state[6:7],
-    ...
-}
-
-# EEF checkpoint:
-state_by_key = {
-    "left_eef_9d": left_eef_9d,    # from ee_pose → rot6d conversion
-    "left_gripper": state[6:7],
-    "right_eef_9d": right_eef_9d,
-    "right_gripper": state[13:14],
-}
-```
-
-**Action parser** — policy returns EEF keys, not joint slices. Concatenate in modality order: `left_eef_9d`, `left_gripper`, `right_eef_9d`, `right_gripper` → then run Step 5 conversion before `/action`.
-
-**Closed-loop pattern** — keep the existing receding-horizon loop (re-infer every `open_loop_horizon` steps, default 8). Only the observation/action formats change.
-
----
-
-### Step 7 — Dry run, then closed loop
-
-**Dry run** (no motion):
+**Dry run** (inference + IK, no `/action` POST):
 
 ```bash
-cd Isaac-GR00T
+source .venv/bin/activate && source scripts/activate_orin.sh
 
-uv run python gr00t/eval/real_robot/realman/deploy_groot_realman.py \
+python gr00t/eval/real_robot/realman/deploy_groot_realman_eef.py \
   --task "pick up bottle" \
-  --robot-url http://<ROBOT_IP>:5000 \
-  --policy-host <GPU_IP> \
+  --robot-url http://localhost:5000 \
+  --policy-host localhost \
   --policy-port 5555 \
-  --hz 15 \
-  --dry-run \
-  --debug
+  --dry-run --debug
 ```
 
-Confirm logged EEF targets look reasonable vs live EE pose.
-
-**Closed loop:**
+**Closed loop (recommended starting flags):**
 
 ```bash
-uv run python gr00t/eval/real_robot/realman/deploy_groot_realman.py \
+python gr00t/eval/real_robot/realman/deploy_groot_realman_eef.py \
   --task "pick up bottle" \
-  --robot-url http://<ROBOT_IP>:5000 \
-  --policy-host <GPU_IP> \
+  --robot-url http://localhost:5000 \
+  --policy-host localhost \
   --policy-port 5555 \
-  --hz 15 \
-  --open-loop-horizon 8 \
-  --max-steps 500
+  --open-loop-horizon 6 \
+  --hz 8 \
+  --auto-close-grip \
+  --grip-close-threshold 0.95
 ```
 
-Start with a low `max-steps`, clear workspace, and e-stop ready. Match `--hz` to the 10–15 Hz collection rate.
+**Tuning jerk/sway:** see [eef-deploy-jerk-report.md](eef-deploy-jerk-report.md) and [eef-deploy-umi-takeaways.md](eef-deploy-umi-takeaways.md). Try `--open-loop-horizon 6–8` before 16; enable TRT on the server.
+
+Confirm startup log shows `GR00T EEF CLOSED-LOOP DEPLOYMENT` and `Initialising RealMan IK`.
 
 ---
 
@@ -303,11 +217,11 @@ Start with a low `max-steps`, clear workspace, and e-stop ready. Match `--hz` to
 
 4. GR00T server (run_gr00t_server.py)
    → denormalize
-   → relative EEF deltas + current eef state → absolute EEF targets
+   → relative EEF trajectory + current eef state → absolute EEF targets
    → gripper absolutes
 
-5. deploy client (new step)
-   → IK or Cartesian: absolute EEF → joint targets
+5. deploy_groot_realman_eef.py
+   → QPIK IK: absolute EEF → joint targets
 
 6. robot_api_server /action
    → Hardware_Bridge → movej_cmd + gripper
@@ -317,16 +231,15 @@ Start with a low `max-steps`, clear workspace, and e-stop ready. Match `--hz` to
 
 ## Implementation checklist
 
-Use this as a task list for the EEF deploy PR:
-
-- [ ] **Bridge:** `get_ee_pose()` in `Hardware_Bridge_ROS2.py`
-- [ ] **API:** `/observation` returns `ee_pose` (14D) or `left_eef_9d` / `right_eef_9d`
-- [ ] **IK:** EEF target → 6 joint angles (per arm); validate against RM65 limits
-- [ ] **Deploy client:** EEF observation builder + EEF action → joint conversion
-- [ ] **Right-arm-only mode:** pin left arm to observed state
-- [ ] **Safety:** reuse EE position limits in `check_safety_limits`
-- [ ] **Dry run:** verify shapes and magnitudes before motion
-- [ ] **Open-loop on robot:** compare one-step EEF prediction vs live EE (optional sanity check)
+- [x] **Bridge:** `get_ee_poses_at_time()` in `ros2_bridge.py`
+- [x] **API:** `/observation` returns `ee_pose` (14D)
+- [x] **IK:** `realman_ik.py` — EEF 9D → 6 joints (right arm deploy)
+- [x] **Deploy client:** `deploy_groot_realman_eef.py`
+- [x] **Right-arm-only:** left arm pinned to observed state
+- [x] **Dry run:** `--dry-run` runs inference + IK without motion
+- [ ] **TRT:** build engines for EEF checkpoint (optional speedup)
+- [ ] **UMI PD1.2:** stale-action skip after inference latency
+- [ ] **Open-loop eval** on held-out EEF trajectories (offline smoothness check)
 
 ---
 
@@ -343,21 +256,22 @@ Use this as a task list for the EEF deploy PR:
 
 | File | Role |
 |------|------|
-| `Isaac-GR00T/examples/RealMan/realman_dual_arm_eef_config.py` | EEF modality keys, `RELATIVE` EEF actions |
-| `scripts/convert_to_eef_gr00t.py` | quat → rot6d conversion (training reference) |
-| `Isaac-GR00T/gr00t/eval/run_gr00t_server.py` | Policy server |
-| `Isaac-GR00T/gr00t/eval/real_robot/realman/deploy_groot_realman.py` | Closed-loop client (needs EEF update) |
-| `scripts/robot_api_server.py` | Robot HTTP API |
-| `src/teleop/Hardware_Bridge_ROS2.py` | ROS2 bridge, EE pose subscribers |
+| `gr00t/eval/real_robot/realman/deploy_groot_realman_eef.py` | EEF closed-loop client |
+| `gr00t/eval/real_robot/realman/eef_utils.py` | `ee_pose` ↔ `eef_9d` conversion |
+| `gr00t/eval/real_robot/realman/realman_ik.py` | QPIK IK (dataset-frame calibrated) |
+| `gr00t/eval/run_gr00t_server.py` | Policy server (relative → absolute EEF) |
+| `pickup-objects/scripts/robot_api_server.py` | Robot HTTP API (`ee_pose`, `state`, images) |
+| `pickup-objects/src/r2d3/hardware/ros2_bridge.py` | ROS2 bridge, `get_ee_poses_at_time()` |
+| `commands.md` | Operator commands (EEF + joint) |
+| `eef-deploy-jerk-report.md` / `eef-deploy-umi-takeaways.md` | Hardware tuning guides |
 
 ---
 
 ## Alternative: joint-space deploy (no IK)
 
-If you need hardware running **before** the EEF bridge is built, use the joint-space checkpoint instead:
+Fallback if IK or EEF checkpoint is unavailable — see **Joint deploy** in [commands.md](commands.md):
 
-- Model: joint finetune (e.g. `gr00t_pick_bottle_realman/checkpoint-10000`)
-- Config: `realman_dual_arm_config.py`
-- Deploy: existing `deploy_groot_realman.py` without changes
+- Checkpoint: `/home/r2d3/checkpoints/gr00t-pick-bottle-realman`
+- Client: `deploy_groot_realman.py` (14D joint actions directly; no IK)
 
-That path outputs 14D joint actions directly. The EEF checkpoint is better for manipulation generalization but requires the extra conversion layer described above.
+The EEF checkpoint is the recommended path for bottle pick; joint deploy avoids the IK layer.

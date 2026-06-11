@@ -72,7 +72,8 @@ commands.md               # Local R2D3 operator runbook (robot + policy terminal
 - **Inference server:** `python gr00t/eval/run_gr00t_server.py --model-path <path> --embodiment-tag <tag>`
 - **Open-loop eval:** `python gr00t/eval/open_loop_eval.py` (dataset replay; see script `--help`)
 - **Sim rollout:** `python gr00t/eval/rollout_policy.py` (supports `--trt-engine-path` on supported platforms)
-- **RealMan live deploy:** `python gr00t/eval/real_robot/realman/deploy_groot_realman.py` (see below)
+- **RealMan EEF deploy:** `python gr00t/eval/real_robot/realman/deploy_groot_realman_eef.py` (see below; checkpoint `gr00t-pick-place-bottle-eef-10k`)
+- **RealMan joint deploy:** `python gr00t/eval/real_robot/realman/deploy_groot_realman.py` (joint checkpoint fallback)
 - **ONNX export:** `python scripts/deployment/export_onnx_n1d7.py`
 - **TensorRT build:** `python scripts/deployment/build_trt_pipeline.py`
 - **Benchmark:** `python scripts/deployment/benchmark_inference.py`
@@ -82,17 +83,24 @@ commands.md               # Local R2D3 operator runbook (robot + policy terminal
 Three-process architecture (see `commands.md` for local terminal commands):
 
 1. **`run_gr00t_server.py` (:5555)** — GR00T ZMQ policy server (normalization, relative→absolute actions). Often runs in the Orin Docker image on a GPU host.
-2. **`robot_api_server.py` (:5000)** — lives in the separate `pickup-objects` repo; cameras, joint state, action execution.
-3. **`deploy_groot_realman.py`** — closed-loop client: fetch obs → policy `get_action` → POST right-arm command only (left arm pinned to observed state).
+2. **`robot_api_server.py` (:5000)** — lives in the separate `pickup-objects` repo; cameras, joint state, `ee_pose`, action execution.
+3. **Deploy client** — closed-loop: fetch obs → policy `get_action` → POST right-arm command only (left arm pinned to observed state).
+   - **EEF:** `deploy_groot_realman_eef.py` — `ee_pose` → EEF obs → IK → joints (`gr00t-pick-place-bottle-eef-10k`)
+   - **Joint:** `deploy_groot_realman.py` — joint obs/actions directly (`gr00t-pick-bottle-realman`)
 
-**Recommended live settings:**
+**EEF recommended live settings** (see `eef-deploy-umi-takeaways.md`, `eef-deploy-jerk-report.md`):
 
-- `--open-loop-horizon 16` — use the full trained horizon for maximum arm reach. Produces a brief jerk every ~16 steps due to inference latency (~700 ms); acceptable in practice.
-- `--auto-close-grip` — gripper ratchet: once the right-gripper command drops below `--grip-close-threshold` (default 0.80), locks to `--grip-lock-value` (default 0.35) and never reopens. Eliminates open/close jitter during bottle approach. Tune threshold if the lock engages too early or late.
-- `--hz 15` — match training collection rate; use `--hz 10` if gripper state is only published at 10 Hz.
-- Omit `--debug` for production runs — debug messages are always written to `run.log` regardless of this flag.
+- `--open-loop-horizon 6` — UMI-style execute horizon (try 4–8; **16** causes boundary jerk on Orin)
+- `--hz 8` or `--hz 10` — slower commanding reduces tracking lag; gripper state at 10 Hz
+- `--auto-close-grip` — gripper ratchet (threshold default 0.80, lock 0.35)
+- TRT DiT-only on server (`--trt-mode dit_only`) — ~4–5 Hz vs ~1.5–2.9 Hz PyTorch eager
 
-**Avoid on hardware:** `--open-loop-horizon 1` at current Orin inference speeds (~700 ms) — the arm will not move because `chunk[0]` is always a hold-position command at 1.5 Hz effective rate.
+**Joint recommended live settings:**
+
+- `--open-loop-horizon 16` with TRT; `--hz 10`–`15`
+- **Avoid** `--open-loop-horizon 1` without TRT (~700 ms infer) — arm barely moves
+
+**Action representation (EEF):** model predicts **relative trajectory** (UMI-style); server decodes to **absolute** EEF; client IK → **absolute** joint commands. Not delta execution on the robot.
 
 **`--debug`** surfaces DEBUG-level messages on the terminal (model chunk on inference, model output vs pinned execute command, `robot_api` POST result, `GRIP LOCK engaged`). These are always written to `run.log` even without `--debug`.
 
@@ -101,7 +109,7 @@ Three-process architecture (see `commands.md` for local terminal commands):
 **Run logging** is on by default. Each run creates `./runs/run_YYYYMMDD_HHMMSS/` containing:
 - `meta.json` — run parameters
 - `run.log` — full timestamped log at DEBUG level (loguru); captures everything even without `--debug` on the terminal
-- `steps.jsonl` — per-step record: observed state (14D), model prediction (14D), executed action (14D), grip lock status, gripper force, inference latency, loop timing
+- `steps.jsonl` — per-step record: state (14D), model action (14D joint / 20D EEF), execute action (14D), grip lock, gripper force, inference/loop timing; EEF adds `ik_ok`, `ik_residual_mm`, `ik_ms`
 - `summary.json` — total steps and duration
 - `videos/` — one smooth MP4 per camera at `--hz`, recorded by a background thread independent of inference timing
 
